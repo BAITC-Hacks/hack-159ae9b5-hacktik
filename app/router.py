@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class Intent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["search", "details", "terms", "prepare", "clarify"]
+    kind: Literal["search", "details", "terms", "prepare", "clarify", "assistant"]
     query: str
     sku: str
     quantity: int = Field(ge=1, le=10000)
@@ -43,11 +43,20 @@ def is_cancel(message: str) -> bool:
 
 
 class DemoRouter:
-    """Simple offline intent matching so the UI can be tried without an API key."""
+    """Fast deterministic commerce routing. All other questions go to the assistant."""
 
     async def classify(self, message: str, last_skus: list[str]) -> Intent:
         text = message.casefold()
         sku = (re.search(r"demo-[a-z0-9-]+", text) or [""])[0].upper()
+        if re.search(r"\bmoq\b|сезон|оборачива|прогноз|в\s+пути|отгруз|закуп|остат[кок].*склад|минимальн.*заказ|қор|жолда", text):
+            return routed(kind="assistant", query=message)
+        if re.search(r"скид|избыт|излиш|рядом|ближай|карт[аеуы]|геолока|жеңілдік|артық|жақын", text):
+            return routed(kind="assistant", query=message)
+        general = bool(re.search(r"^(?:объясни|расскажи|напиши|помоги|сравни|подскажи|почему|зачем|"
+                                 r"что\s+такое|как\s+(?:работает|устроен|сделать|написать|улучшить)|"
+                                 r"түсіндір|жазып|неге|explain|write|why)\b", text.strip()))
+        if general:
+            return routed(kind="assistant", query=message)
         if any(word in text for word in ("достав", "жеткіз", "delivery", "оплат", "төлем", "payment",
                                          "возврат", "қайтар", "return", "услови", "шарт", "terms")):
             term = ("delivery" if any(w in text for w in ("достав", "жеткіз", "delivery")) else
@@ -55,6 +64,9 @@ class DemoRouter:
                     "returns" if any(w in text for w in ("возврат", "қайтар", "return")) else "general")
             return routed(kind="terms", term=term)
         if any(word in text for word in ("добав", "корзин", "қос", "себет", "add ", "buy ", "беріңіз")):
+            # "Add logging to my code" is a writing question, never a cart command.
+            if re.search(r"код|функци|юмор|текст|программ|python|javascript|logging", text):
+                return routed(kind="assistant", query=message)
             # Only treat explicit count syntax as quantity. "16 А" is a rating, not 16 units.
             count = re.search(r"(?<!\w)(\d{1,4})\s*(?:шт\.?|штук|дана|pieces|units)\b", text)
             if not count:
@@ -69,6 +81,9 @@ class DemoRouter:
                           query=query, quantity=int(count.group(1)) if count else 1)
         if sku:
             return routed(kind="details", sku=sku)
+        if len(text.split()) > 6 or re.search(r"[?]|привет|здравствуй|сәлем|аккаунт|гость", text):
+            if not re.search(r"цен[ау]|стоит|наличи|остаток|бағасы|бар\s+ма", text):
+                return routed(kind="assistant", query=message)
         return routed(kind="search", query=message)
 
 
@@ -107,4 +122,6 @@ class OpenAIRouter:
 
 
 def build_router():
-    return OpenAIRouter() if os.getenv("OPENAI_API_KEY") else DemoRouter()
+    # General generation is handled by KnowledgeAssistant. Mutating intent must not
+    # depend on model output, and a simple lookup must not incur an API round trip.
+    return DemoRouter()

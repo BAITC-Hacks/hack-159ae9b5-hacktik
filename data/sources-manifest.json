@@ -1,0 +1,46 @@
+[
+  {
+    "name": "MOQ SystemElectric.xlsx",
+    "rows": 556,
+    "sheets": [
+      "Лист_1"
+    ]
+  },
+  {
+    "name": "Динамика продаж_Syseme Electric_2025-2026.xlsx",
+    "rows": 77314,
+    "sheets": [
+      "Лист_1"
+    ]
+  },
+  {
+    "name": "Ежемесячные остатки SystemElectric 2024-2026.xlsx",
+    "rows": 702,
+    "sheets": [
+      "Лист_1"
+    ]
+  },
+  {
+    "name": "Ежемесячные продажи в кол-м выражении SystemElectric 2024-2026.xlsx",
+    "rows": 576,
+    "sheets": [
+      "Лист_1",
+      "Лист1"
+    ]
+  },
+  {
+    "name": "Сезонность SystemElectric 2024-2026.xlsx",
+    "rows": 19,
+    "sheets": [
+      "Лист1"
+    ]
+  },
+  {
+    "name": "Товар в пути_SystemElectric на 22.09.2026.xlsx",
+    "rows": 518,
+    "sheets": [
+      "TDSheet",
+      "Лист1"
+    ]
+  }
+]

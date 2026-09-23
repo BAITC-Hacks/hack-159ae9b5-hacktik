@@ -5,13 +5,14 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .catalog import (CartLine, CatalogGateway, InsufficientStock, PriceChanged,
                       Product, UnknownProduct)
 from .router import is_cancel, is_explicit_yes, language_of
+from .ai import KnowledgeAssistant, context_sources, public_context, remember
 
 
 class ProductView(BaseModel):
@@ -48,6 +49,8 @@ class ChatResponse(BaseModel):
     checkout_url: str | None = None
     sources: list[Source] = Field(default_factory=list)
     demo: bool = True
+    mode: Literal["local", "ai"] = "local"
+    offers: list[dict[str, Any]] = Field(default_factory=list)
 
 
 @dataclass
@@ -62,8 +65,10 @@ class Pending:
 @dataclass
 class Conversation:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    cart_key: str | None = None
     last_skus: list[str] = field(default_factory=list)
     pending: Pending | None = None
+    history: list[dict[str, str]] = field(default_factory=list)
     last_seen: float = field(default_factory=time.time)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -103,6 +108,8 @@ TERMS = {
 
 
 def contains_payment_secret(message: str) -> bool:
+    if re.search(r"\bsk-[A-Za-z0-9_-]{10,}|\b(?:api_key|OPENAI_API_KEY)\s*[:=]\s*\S+", message):
+        return True
     if re.search(r"(?i)\b(?:cvv|cvc|password|card\s*number|номер\s*карты|пароль)\b|құпия\s*сөз|карта\s*нөмірі", message):
         return True
     for candidate in re.findall(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)", message):
@@ -116,9 +123,11 @@ def contains_payment_secret(message: str) -> bool:
 
 
 class ChatService:
-    def __init__(self, catalog: CatalogGateway, router: Any):
+    def __init__(self, catalog: CatalogGateway, router: Any, platform: Any = None):
         self.catalog = catalog
         self.router = router
+        self.platform = platform
+        self.assistant = KnowledgeAssistant()
 
     @staticmethod
     def view(product: Product, locale: str) -> ProductView:
@@ -128,61 +137,91 @@ class ChatService:
 
     async def response(self, session: Conversation, locale: str, reply: str, **kwargs: Any) -> ChatResponse:
         return ChatResponse(reply=reply, locale=locale,
-                            cart=await self.catalog.get_cart(session.id), **kwargs)
+                            cart=await self.catalog.get_cart(session.cart_key or session.id), **kwargs)
 
-    async def chat(self, session: Conversation, message: str, requested_locale: str) -> ChatResponse:
+    async def chat(self, session: Conversation, message: str, requested_locale: str,
+                   lat: float | None = None, lng: float | None = None) -> ChatResponse:
         locale = language_of(message, requested_locale)
         async with session.lock:
-            if contains_payment_secret(message):
-                session.pending = None
-                return await self.response(session, locale, self._msg(locale, "payment_block"))
-            if session.pending and time.time() > session.pending.expires_at:
-                session.pending = None
-            if session.pending and is_explicit_yes(message):
-                return await self._confirm_locked(session, session.pending.id, locale)
-            if session.pending and is_cancel(message):
-                session.pending = None
-                return await self.response(session, locale, self._msg(locale, "cancel"))
-            # An intervening question invalidates the old proposal; an isolated 'yes' later cannot use it.
+            result = await self._chat_locked(session, message, locale, lat, lng)
+            if not contains_payment_secret(message):
+                remember(session.history, message, result.reply)
+            return result
+
+    async def _chat_locked(self, session: Conversation, message: str, locale: str,
+                           lat: float | None, lng: float | None) -> ChatResponse:
+        if contains_payment_secret(message):
             session.pending = None
-            intent = await self.router.classify(message, session.last_skus)
-            if intent.kind == "terms":
-                ru, kk, url, label = TERMS[intent.term]
-                return await self.response(session, locale, kk if locale == "kk" else ru,
-                                           sources=[Source(label=label, url=url)])
-            if intent.kind == "clarify":
-                return await self.response(session, locale, self._msg(locale, "clarify"))
-            if intent.kind == "prepare":
-                sku = intent.sku
-                if not sku and intent.query:
-                    matches = await self.catalog.search_products(intent.query)
-                    if len(matches) == 1:
-                        sku = matches[0].sku
-                    elif matches:
-                        session.last_skus = [p.sku for p in matches]
-                        return await self.response(session, locale, self._msg(locale, "choose"),
-                                                   products=[self.view(p, locale) for p in matches])
-                if not sku and len(session.last_skus) == 1:
-                    sku = session.last_skus[0]
-                if not sku:
-                    return await self.response(session, locale, self._msg(locale, "choose"))
-                return await self._propose_locked(session, sku, intent.quantity, locale)
-            if intent.kind == "details" and intent.sku:
-                product = await self.catalog.get_product(intent.sku)
-                matches = [product] if product else []
-            else:
-                matches = await self.catalog.search_products(intent.query or message)
-            if not matches:
-                session.last_skus = []
-                return await self.response(session, locale, self._msg(locale, "missing"))
-            session.last_skus = [p.sku for p in matches]
-            out_of_stock = next((p for p in matches if p.stock == 0), None)
-            alternatives = await self.catalog.find_alternatives(out_of_stock.sku) if out_of_stock else []
-            reply = self._msg(locale, "out" if out_of_stock else "found")
-            return await self.response(session, locale, reply,
-                                       products=[self.view(p, locale) for p in matches],
-                                       alternatives=[self.view(p, locale) for p in alternatives],
-                                       alternative_reason=self._msg(locale, "similar") if alternatives else None)
+            return await self.response(session, locale, self._msg(locale, "payment_block"))
+        if session.pending and time.time() > session.pending.expires_at:
+            session.pending = None
+        if session.pending and is_explicit_yes(message):
+            return await self._confirm_locked(session, session.pending.id, locale)
+        if session.pending and is_cancel(message):
+            session.pending = None
+            return await self.response(session, locale, self._msg(locale, "cancel"))
+        # An intervening question invalidates the old proposal; an isolated 'yes' later cannot use it.
+        session.pending = None
+        intent = await self.router.classify(message, session.last_skus)
+        if intent.kind == "assistant":
+            return await self._answer_locked(session, message, locale, lat, lng)
+        if intent.kind == "terms":
+            ru, kk, url, label = TERMS[intent.term]
+            return await self.response(session, locale, kk if locale == "kk" else ru,
+                                       sources=[Source(label=label, url=url)])
+        if intent.kind == "clarify":
+            return await self._answer_locked(session, message, locale, lat, lng)
+        if intent.kind == "prepare":
+            sku = intent.sku
+            if not sku and intent.query:
+                matches = await self.catalog.search_products(intent.query)
+                if len(matches) == 1:
+                    sku = matches[0].sku
+                elif matches:
+                    session.last_skus = [p.sku for p in matches]
+                    return await self.response(session, locale, self._msg(locale, "choose"),
+                                               products=[self.view(p, locale) for p in matches])
+            if not sku and len(session.last_skus) == 1:
+                sku = session.last_skus[0]
+            if not sku:
+                return await self.response(session, locale, self._msg(locale, "choose"))
+            return await self._propose_locked(session, sku, intent.quantity, locale)
+        if intent.kind == "details" and intent.sku:
+            product = await self.catalog.get_product(intent.sku)
+            matches = [product] if product else []
+        else:
+            matches = await self.catalog.search_products(intent.query or message)
+        if not matches:
+            return await self._answer_locked(session, message, locale, lat, lng)
+        session.last_skus = [p.sku for p in matches]
+        out_of_stock = next((p for p in matches if p.stock == 0), None)
+        alternatives = await self.catalog.find_alternatives(out_of_stock.sku) if out_of_stock else []
+        reply = self._msg(locale, "out" if out_of_stock else "found")
+        return await self.response(session, locale, reply,
+                                   products=[self.view(p, locale) for p in matches],
+                                   alternatives=[self.view(p, locale) for p in alternatives],
+                                   alternative_reason=self._msg(locale, "similar") if alternatives else None)
+
+    async def _answer_locked(self, session: Conversation, message: str, locale: str,
+                              lat: float | None, lng: float | None) -> ChatResponse:
+        context = self.platform.context(message, lat=lat, lng=lng) if self.platform is not None else {}
+        context = public_context(context)
+        if not context["products"]:
+            products = []
+            if session.last_skus and re.search(r"\b(их|это|эти|этот|него|них|они|сравни|олар|осы)\b", message.casefold()):
+                products = [product for sku in session.last_skus[:5]
+                            if (product := await self.catalog.get_product(sku)) is not None]
+            if not products and self.platform is None:
+                products = await self.catalog.search_products(message)
+            context["products"] = [item.model_dump(mode="json") for item in products]
+            context = public_context(context)
+        # Location is used by the retrieval layer only. Exact user coordinates are
+        # not sent to the model; distances to public offers are enough for advice.
+        reply, mode = await self.assistant.answer(message, locale, session.history, context,
+                                                  has_location=lat is not None and lng is not None)
+        return await self.response(session, locale, reply, mode=mode,
+                                   sources=[Source(**source) for source in context_sources(context)],
+                                   offers=context["offers"])
 
     async def propose(self, session: Conversation, sku: str, quantity: int, locale: str) -> ChatResponse:
         async with session.lock:
@@ -224,7 +263,7 @@ class ChatService:
         # A one-time, server-side proposal binds SKU, quantity and observed price.
         session.pending = None
         try:
-            line = await self.catalog.add_checked(session.id, pending.sku, pending.quantity,
+            line = await self.catalog.add_checked(session.cart_key or session.id, pending.sku, pending.quantity,
                                                   locale, pending.price_kzt)
         except PriceChanged:
             product = await self.catalog.get_product(pending.sku)
@@ -240,7 +279,7 @@ class ChatService:
         except UnknownProduct:
             return await self.response(session, locale, self._msg(locale, "missing"))
         return await self.response(session, locale, self._msg(locale, "added"),
-                                   checkout_url=await self.catalog.checkout_url(session.id))
+                                   checkout_url=await self.catalog.checkout_url(session.cart_key or session.id))
 
     @staticmethod
     def _msg(locale: str, key: str) -> str:

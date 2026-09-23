@@ -1,14 +1,8 @@
-# frontend
-frontend/node_modules/
-frontend/.next/
-frontend/.env.local
-frontend/tsconfig.tsbuildinfo
-
-# backend
-backend/.venv/
-backend/__pycache__/
-backend/app/__pycache__/
-*.pyc
-
-# data
-backend/data/raw/*.xlsx
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.bundle

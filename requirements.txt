@@ -1,6 +1,5 @@
--c requirements-tested.txt
-fastapi>=0.115,<1
-uvicorn>=0.30,<1
-openai>=2.0,<3
-pydantic>=2.9,<3
-httpx[socks]>=0.27,<1
+fastapi==0.141.1
+uvicorn==0.53.0
+openai==2.54.0
+pydantic==2.13.5
+httpx[socks]==0.28.1
